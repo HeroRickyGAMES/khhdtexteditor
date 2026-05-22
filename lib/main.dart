@@ -106,18 +106,20 @@ class HexEditor {
         // Adiciona uma verificação para os limites do arquivo
         if (pointerTableEnd > data.length || pointerTableStart >= pointerTableEnd) {
           print("ERRO: Offsets CTD calculados inválidos (${pointerTableStart.toRadixString(16)}, ${pointerTableEnd.toRadixString(16)}, ${pointerBaseAddress.toRadixString(16)}). Usando valores de fallback.");
-          // Valores de fallback se os offsets calculados forem inválidos
+          // Valores de fallback se os offsets calculados forem inválidos.
+          // IMPORTANTE: pointerTableEnd deve ser IGUAL a pointerBaseAddress no formato CTD —
+          // a tabela de ponteiros termina exatamente onde a região de strings começa.
           pointerTableStart = 0x194;
-          pointerTableEnd = 0x0A74;
-          pointerBaseAddress = 0x0A70; // Fallback para ponteiros relativos
+          pointerBaseAddress = 0x0A70;
+          pointerTableEnd = 0x0A70; // = pointerBaseAddress (bug anterior: era 0x0A74, lendo 4 bytes extras)
         }
 
       } else {
         // Fallback para tipo UNKNOWN ou se os magic numbers não corresponderem
         print("Tipo de arquivo UNKNOWN ou magic numbers não correspondem. Usando valores de fallback.");
-        pointerTableStart = 0x194; // Fallback value
-        pointerTableEnd = 0x0A74; // Fallback value
-        pointerBaseAddress = 0x0A70; // Fallback value
+        pointerTableStart = 0x194;
+        pointerBaseAddress = 0x0A70;
+        pointerTableEnd = 0x0A70; // = pointerBaseAddress (nunca pode diferir no formato CTD)
       }
 
       print("Tabela de Ponteiros Inicia em: 0x${pointerTableStart.toRadixString(16).toUpperCase()}");
@@ -127,10 +129,9 @@ class HexEditor {
 
     } catch (e) {
       print("Erro ao analisar o header para o tipo $_fileType. Usando valores de fallback. Erro: $e");
-      // Fallback genérico em caso de erro na leitura do header
       pointerTableStart = 0x194;
-      pointerTableEnd = 0x0A74;
       pointerBaseAddress = 0x0A70;
+      pointerTableEnd = 0x0A70; // = pointerBaseAddress
     }
   }
 

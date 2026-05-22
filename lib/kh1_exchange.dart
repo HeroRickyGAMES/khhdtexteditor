@@ -154,7 +154,15 @@ class KH1Encoding {
       if (b == 0x01) {
         sb.write(' ');
       } else if (b == 0x0A) {
-        sb.write('\n');
+        // Em modo EvMsg (breakOnEnd=false) o 0x0A aparece nos bytes separadores e
+        // precisa sobreviver ao round-trip encode→decode sem ser convertido em espaço.
+        // Codificamos como [C:0A] para que protectTerms() o preserve na tradução.
+        // Em modo normal (breakOnEnd=true) mantemos como \n para compatibilidade.
+        if (breakOnEnd) {
+          sb.write('\n');
+        } else {
+          sb.write('[C:0A]');
+        }
       } else if (b >= 0x03 && b <= 0x1F) {
         sb.write('[C:${b.toRadixString(16).toUpperCase().padLeft(2, '0')}]');
       } else if (b >= 0x2B && b <= 0x44) {
@@ -302,8 +310,9 @@ class ExchangeFile {
   // Para _loadEvMsg()/_saveEvMsg(): regiões de texto dentro do arquivo EvMsg
   // Paralelas entre si; _evmsgAllStringIdx[i] = índice em strings[] ou -1 (entrada sem texto real)
   List<int> _evmsgAllTextStarts = []; // posição onde o texto começa (após 07 0C 00)
-  List<int> _evmsgAllTextEnds = [];   // posição do byte 05 (fim exclusivo do texto)
+  List<int> _evmsgAllTextEnds = [];   // posição do próximo marcador (fim exclusivo da região)
   List<int> _evmsgAllStringIdx = [];  // índice em strings[], ou -1 se não é texto real
+  List<Uint8List> _evmsgAllSuffixes = []; // bytes do sufixo (a partir de 04/05 até próximo marcador)
 
   ExchangeFile({
     required this.ukDataPath,
@@ -329,6 +338,7 @@ class ExchangeFile {
     _evmsgAllTextStarts.clear();
     _evmsgAllTextEnds.clear();
     _evmsgAllStringIdx.clear();
+    _evmsgAllSuffixes.clear();
     final data = File(ukDataPath).readAsBytesSync();
     _rawData = data;
 
@@ -364,12 +374,11 @@ class ExchangeFile {
       }
     }
 
-    // Cada entrada: texto vai de (marker+3) até o próximo marker (ou fim do arquivo).
+    // Cada entrada: texto vai de (marker+3) até o byte 04 ou 05 (terminador).
+    // O sufixo (a partir do terminador até o próximo marker) é preservado verbatim.
     // Funciona para ambos os subformatos:
     //   Tipo A (dc01): 07 0C 00 [texto] 05 [separador 8 bytes] 07 0C 00 ...
-    //   Tipo B (di01): 07 0C 00 [texto 04] 07 0C 00 [texto 04] ...
-    // O separador/terminador (05, 04, etc.) faz parte do bloco "texto" e sobrevive
-    // ao round-trip encode/decode como [C:05], [C:04], [?:00], etc.
+    //   Tipo B (di01): 07 0C 00 [texto 04] 07 0C 00 ...
     for (int i = 0; i < markers.length; i++) {
       final textStart = markers[i] + 3;
       final textEnd   = (i + 1 < markers.length) ? markers[i + 1] : data.length;
@@ -377,9 +386,20 @@ class ExchangeFile {
       _evmsgAllTextStarts.add(textStart);
       _evmsgAllTextEnds.add(textEnd);
 
-      // Decodifica com breakOnEnd=false (0x00/0x02/0x04/0x05 são códigos de controle)
+      // Localiza o byte terminador (0x04 ou 0x05) que separa texto do sufixo binário.
+      // O sufixo contém dados de sincronização que não devem ser traduzidos.
+      int terminatorPos = textEnd;
+      for (int j = textStart; j < textEnd; j++) {
+        if (data[j] == 0x04 || data[j] == 0x05) {
+          terminatorPos = j;
+          break;
+        }
+      }
+      _evmsgAllSuffixes.add(data.sublist(terminatorPos, textEnd));
+
+      // Decodifica apenas a porção de texto (sem sufixo), com breakOnEnd=false
       final decoded = KH1Encoding.decode(
-        data.sublist(textStart, textEnd),
+        data.sublist(textStart, terminatorPos),
         breakOnEnd: false,
       );
       // Filtra: só inclui entradas com conteúdo alfabético real
@@ -577,8 +597,11 @@ class ExchangeFile {
       out.addAll(data.sublist(pos, tStart));
 
       if (si >= 0 && si < strings.length) {
-        // Entrada com texto real: escreve tradução codificada
+        // Entrada com texto real: escreve tradução codificada + sufixo original verbatim
         out.addAll(KH1Encoding.encode(strings[si]));
+        if (i < _evmsgAllSuffixes.length) {
+          out.addAll(_evmsgAllSuffixes[i]);
+        }
       } else {
         // Entrada sem texto real (binário/controle): copia verbatim
         out.addAll(data.sublist(tStart, tEnd));
@@ -865,9 +888,17 @@ class KH1BatchTranslator {
   }
 
   // -----------------------------------------------------------------------
-  // Escaneia remastered/*.ard/UK_*.ev (legendas de cutscene)
-  // Arquivos EvMsg (magic "EvMsg"): isEvMsg=true, inPlace=false (rebuild livre)
-  // Outros .ev/.evdl/.binl: inPlace=true (patch no lugar)
+  // Escaneia remastered/*.ard/UK_*.binl (legendas de cutscene)
+  //
+  // ATENÇÃO: apenas arquivos .binl contêm texto de legenda.
+  //   .ev e .evdl são scripts de evento em formato binário puro — 07 0C 00
+  //   aparece neles como opcode de script, NÃO como marcador de texto.
+  //   Processá-los com inPlace=true corromperia os scripts do jogo.
+  //
+  // Formatos suportados para .binl:
+  //   EvMsg (magic "EvMsg"): isEvMsg=true, inPlace=false (rebuild livre)
+  //   MessageV361:           isMessageV361=true, inPlace=false (rebuild com tabela)
+  //   Outros:                ignorados (binários sem texto)
   // -----------------------------------------------------------------------
   List<ExchangeFile> _scanRemasteredEv() {
     final remasteredDir = Directory('$hedOutPath/remastered');
@@ -878,15 +909,20 @@ class KH1BatchTranslator {
       for (final f in entry.listSync().whereType<File>()) {
         final name = f.path.split('/').last;
         if (!name.startsWith('UK_')) continue;
-        if (!name.endsWith('.ev') && !name.endsWith('.evdl') && !name.endsWith('.binl')) continue;
+        // Apenas .binl contém legendas; .ev e .evdl são scripts binários de evento
+        if (!name.endsWith('.binl')) continue;
         final raw = f.readAsBytesSync();
         final evMsg = _isEvMsg(raw);
+        final isMsg361 = !evMsg && _isMessageV361(raw);
+        // Ignora .binl que não é formato reconhecido de texto (binário puro)
+        if (!evMsg && !isMsg361) continue;
         result.add(ExchangeFile(
           ukDataPath: f.path,
           spDataPath: f.path.replaceFirst('/UK_', '/SP_'),
           hasPair: false,
-          inPlace: !evMsg,  // EvMsg é reconstruído, outros são patchados no lugar
+          inPlace: false,
           isEvMsg: evMsg,
+          isMessageV361: isMsg361,
         ));
       }
     }
@@ -1011,6 +1047,54 @@ class KH1BatchTranslator {
   }
 
   // -----------------------------------------------------------------------
+  // Helpers para prevenir overflow de texto nos balões EvMsg
+  // O balão é dimensionado para o texto original (inglês); PT mais longo causa overflow.
+  // -----------------------------------------------------------------------
+
+  // Limita cada linha traduzida ao comprimento (em chars visíveis) da linha original.
+  // Linhas são separadas por [C:02]. Se o número de linhas difere, retorna sem alterar.
+  static String _clampEvMsgLines(String translated, String original) {
+    const sep = '[C:02]';
+    final origLines = original.split(sep);
+    final transLines = translated.split(sep);
+    if (origLines.length != transLines.length) return translated;
+
+    final result = <String>[];
+    for (int i = 0; i < origLines.length; i++) {
+      // +2 chars de margem: acomoda palavras ligeiramente maiores em PT sem overflow
+      final budget = _evmsgCleanLen(origLines[i]) + 2;
+      final tLine = transLines[i];
+      result.add(_evmsgCleanLen(tLine) <= budget
+          ? tLine
+          : _evmsgTruncateAtWord(tLine, budget));
+    }
+    return result.join(sep);
+  }
+
+  // Conta caracteres visíveis (exclui placeholders [C:XX], [BTN:XX], [?:XX])
+  static int _evmsgCleanLen(String s) =>
+      s.replaceAll(RegExp(r'\[[^\]]+\]'), '').length;
+
+  // Trunca s para maxClean chars visíveis, cortando no último espaço
+  static String _evmsgTruncateAtWord(String s, int maxClean) {
+    final code = RegExp(r'\[[^\]]+\]');
+    int clean = 0;
+    int lastSpace = -1;
+    int i = 0;
+    while (i < s.length) {
+      final m = code.matchAsPrefix(s, i);
+      if (m != null) { i = m.end; continue; }
+      if (s[i] == ' ') lastSpace = i;
+      if (++clean > maxClean) {
+        final cut = lastSpace >= 0 ? lastSpace : i;
+        return s.substring(0, cut).trim();
+      }
+      i++;
+    }
+    return s;
+  }
+
+  // -----------------------------------------------------------------------
   // Traduz todos os arquivos — N arquivos concorrentes, strings sequenciais
   // por arquivo (mais simples e sem race conditions no save)
   // -----------------------------------------------------------------------
@@ -1093,6 +1177,11 @@ class KH1BatchTranslator {
               translatedText = KH1Encoding.restoreTerms(translatedText, prot);
               // Remover \n do texto traduzido — o game trata 0x0A como fim de string
               translatedText = translatedText.replaceAll('\n', ' ').trim();
+              // Para EvMsg: limita cada linha ao comprimento da linha original
+              // O balão é dimensionado para o texto inglês — PT mais longo causa overflow
+              if (ef.isEvMsg) {
+                translatedText = _clampEvMsgLines(translatedText, original);
+              }
               ef.editString(si, translatedText);
               translated++;
             }
