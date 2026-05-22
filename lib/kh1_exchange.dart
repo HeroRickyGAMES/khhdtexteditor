@@ -1057,8 +1057,11 @@ class KH1BatchTranslator {
   //   - As línguas europeias são em média 15-25% mais longas que o inglês
   //   - O p90 de TODAS as localizações oficiais fica em ≤36 chars por linha
   // Regra: UK_len × 1.3, mínimo UK+2, máximo 36 chars
+  // Nota: clamp() em Dart exige min <= max, então cap = max(ukLen+2, 36)
   static int _evmsgLineBudget(int ukLen) {
-    return ((ukLen * 1.3).round()).clamp(ukLen + 2, 36);
+    final minBudget = ukLen + 2;
+    final cap = minBudget > 36 ? minBudget : 36;
+    return ((ukLen * 1.3).round()).clamp(minBudget, cap);
   }
 
   // Limita cada linha traduzida ao budget calculado a partir do comprimento UK original.
