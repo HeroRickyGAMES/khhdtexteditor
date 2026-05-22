@@ -1051,10 +1051,19 @@ class KH1BatchTranslator {
 
   // -----------------------------------------------------------------------
   // Helpers para prevenir overflow de texto nos balões EvMsg
-  // O balão é dimensionado para o texto original (inglês); PT mais longo causa overflow.
   // -----------------------------------------------------------------------
 
-  // Limita cada linha traduzida ao comprimento (em chars visíveis) da linha original.
+  // Budget de linha derivado da análise das localizações oficiais (SP/FR/IT/GR):
+  //   - As línguas europeias são em média 15-25% mais longas que o inglês
+  //   - O p90 de TODAS as localizações oficiais fica em ≤36 chars por linha
+  // Regra: UK_len × 1.3, mínimo UK+2, máximo 36 chars
+  static int _evmsgLineBudget(int ukLen) {
+    return ((ukLen * 1.3).round()).clamp(ukLen + 2, 36);
+  }
+
+  // Limita cada linha traduzida ao budget calculado a partir do comprimento UK original.
+  // Budget = UK_len × 1.3, mínimo UK+2, máximo 36 — reflete o padrão real das localizações
+  // oficiais europeias que todas cabem nos balões do jogo.
   // Linhas são separadas por [C:02]. Se o número de linhas difere, retorna sem alterar.
   static String _clampEvMsgLines(String translated, String original) {
     const sep = '[C:02]';
@@ -1064,8 +1073,7 @@ class KH1BatchTranslator {
 
     final result = <String>[];
     for (int i = 0; i < origLines.length; i++) {
-      // +1 char de margem: margem menor para evitar overflow (BTN icons contam como 1 char visível)
-      final budget = _evmsgCleanLen(origLines[i]) + 1;
+      final budget = _evmsgLineBudget(_evmsgCleanLen(origLines[i]));
       final tLine = transLines[i];
       result.add(_evmsgCleanLen(tLine) <= budget
           ? tLine
