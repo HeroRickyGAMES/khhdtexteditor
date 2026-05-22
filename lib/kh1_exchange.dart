@@ -131,6 +131,9 @@ class KH1Encoding {
   static const Map<String, String> _characterTranslations = {
     'Goofy': 'Pateta',
     'Maleficent': 'Malévola',
+    // Comandos de batalha: Google traduz mal quando são palavras isoladas
+    'Attack': 'Atacar',
+    'Items': 'Itens',
   };
 
   // -----------------------------------------------------------------------
@@ -1061,8 +1064,8 @@ class KH1BatchTranslator {
 
     final result = <String>[];
     for (int i = 0; i < origLines.length; i++) {
-      // +2 chars de margem: acomoda palavras ligeiramente maiores em PT sem overflow
-      final budget = _evmsgCleanLen(origLines[i]) + 2;
+      // +1 char de margem: margem menor para evitar overflow (BTN icons contam como 1 char visível)
+      final budget = _evmsgCleanLen(origLines[i]) + 1;
       final tLine = transLines[i];
       result.add(_evmsgCleanLen(tLine) <= budget
           ? tLine
@@ -1071,11 +1074,18 @@ class KH1BatchTranslator {
     return result.join(sep);
   }
 
-  // Conta caracteres visíveis (exclui placeholders [C:XX], [BTN:XX], [?:XX])
-  static int _evmsgCleanLen(String s) =>
-      s.replaceAll(RegExp(r'\[[^\]]+\]'), '').length;
+  // Conta caracteres visíveis:
+  //   [C:XX] e [?:XX] = controle/posição, invisíveis → removidos
+  //   [BTN:XX] = ícone/glifo visível (ex: apóstrofo 0x71) → conta como 1 char
+  static int _evmsgCleanLen(String s) {
+    return s
+        .replaceAll(RegExp(r'\[(?:C|\?):[\dA-Fa-f]{2}\]'), '')
+        .replaceAll(RegExp(r'\[BTN:[\dA-Fa-f]{2}\]'), 'X')
+        .length;
+  }
 
-  // Trunca s para maxClean chars visíveis, cortando no último espaço
+  // Trunca s para maxClean chars visíveis, cortando no último espaço.
+  // [BTN:XX] conta como 1 char visível; [C:XX] e [?:XX] são invisíveis.
   static String _evmsgTruncateAtWord(String s, int maxClean) {
     final code = RegExp(r'\[[^\]]+\]');
     int clean = 0;
@@ -1083,7 +1093,12 @@ class KH1BatchTranslator {
     int i = 0;
     while (i < s.length) {
       final m = code.matchAsPrefix(s, i);
-      if (m != null) { i = m.end; continue; }
+      if (m != null) {
+        // BTN icons são glyphs visíveis → contam como 1 char
+        if (m.group(0)!.startsWith('[BTN:')) clean++;
+        i = m.end;
+        continue;
+      }
       if (s[i] == ' ') lastSpace = i;
       if (++clean > maxClean) {
         final cut = lastSpace >= 0 ? lastSpace : i;
