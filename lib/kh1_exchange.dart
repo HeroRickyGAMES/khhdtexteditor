@@ -63,6 +63,8 @@ class KH1Encoding {
     0x6D: '…',
     0x6E: '-',
     0x6F: '-',
+    // BTN icons com mapeamento de texto confirmado
+    0x71: "'", // apóstrofe: "can't", "didn't", "people's" — confirmado em múltiplos arquivos
   };
 
   static const Map<String, int> _punctReverseMap = {
@@ -81,6 +83,7 @@ class KH1Encoding {
     ':': 0x6B,
     ';': 0x6C,
     '…': 0x6D,
+    "'": 0x71, // apóstrofe → BTN 0x71
   };
 
   // Mapeamento CORRETO de caracteres acentuados → bytes KH1
@@ -175,7 +178,13 @@ class KH1Encoding {
       } else if (_punctMap.containsKey(b)) {
         sb.write(_punctMap[b]);
       } else if (b >= 0x70 && b <= 0xBF) {
-        sb.write('[BTN:${b.toRadixString(16).toUpperCase().padLeft(2, '0')}]');
+        // Verifica se o BTN tem mapeamento de texto (ex: 0x71 = apóstrofe)
+        final btnChar = _punctMap[b];
+        if (btnChar != null) {
+          sb.write(btnChar);
+        } else {
+          sb.write('[BTN:${b.toRadixString(16).toUpperCase().padLeft(2, '0')}]');
+        }
       } else if (b >= 0xC0) {
         // Mapeamento correto de bytes KH1 → caracteres (NÃO é Latin-1 direto)
         final decoded = _accentDecode[b];
@@ -329,6 +338,9 @@ class ExchangeFile {
     this.nullOnly = false,
     this.isEvdl = false,
   });
+
+  // Expõe offsets para testes de integração (verifica terminadores após save)
+  List<int> get rawOffsetsForTest => List.unmodifiable(_rawOffsets);
 
   // -----------------------------------------------------------------------
   // Carrega o arquivo UK como fonte de tradução
@@ -971,6 +983,26 @@ class KH1BatchTranslator {
 
   // -----------------------------------------------------------------------
   // Escaneia remastered/*.ard/UK_*.{binl,evdl} (legendas + diálogos de cutscene)
+  //
+  // Prefixos de área dos arquivos .ard (confirmdos por conteúdo):
+  //   dh — Dive to the Heart / Station of Awakening (Sora's dream)
+  //   di — Destiny Islands
+  //   tw — Traverse Town
+  //   dc — Disney Castle
+  //   wl — Wonderland (Alice)
+  //   co — Coliseum (Olympus Coliseum — mapa Hércules)
+  //   he — Hercules area (boss/interior)
+  //   dj — Deep Jungle (Tarzan)
+  //   ag — Agrabah (Aladdin)
+  //   mu — Monstro (Pinocchio)
+  //   at — Atlantica (Little Mermaid)
+  //   ha — Halloween Town / nm = Nightmare = mesmo mundo
+  //   nm — Nightmare → Halloween Town (Jack Skellington)
+  //   nv — Neverland (Peter Pan) — pasta pi = pirate ship
+  //   pi — Pirate ship / 100 Acre Wood (Winnie the Pooh — dentro do pi37.ard)
+  //   lm — Land of Dragons / outros mundos extras
+  //   pc — Princess Castle → Hollow Bastion (Malévola, Riku, Ansem)
+  //   ew — End of the World (área final)
   //
   // .binl — legendas de cutscene:
   //   EvMsg (magic "EvMsg"): isEvMsg=true, rebuild livre
