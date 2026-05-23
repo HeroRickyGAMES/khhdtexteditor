@@ -423,24 +423,26 @@ class ExchangeFile {
 
   // -----------------------------------------------------------------------
   // Formato EVDL (Event Data List — scripts de evento com diálogo inline):
-  //   Texto KH1 fica embutido diretamente no binário, separado pelo opcode 0x06.
-  //   Estrutura: [bytes de texto KH1][0x06][params]...
-  //   Bytes de texto válidos: 0x01 (espaço), 0x2B-0x6F (A-Z, a-z, pontuação),
-  //                           0xC0-0xFF (acentuados)
-  //   In-place: texto mais curto → padding 0x00 (render para em null, 0x06 não se move)
-  //             texto mais longo → truncado na palavra antes de atingir o 0x06
+  //   Texto KH1 fica embutido diretamente no binário.
+  //   Dois tipos de terminador observados em análise de múltiplas áreas:
+  //     0x06 — opcode de evento (objeto/notificação): "Empty.", "Burned out."
+  //     0x02 — string end KH1 (diálogo da história): "It was reckless...", "When we took the princess"
+  //   Ambos são aceitos; o terminador é preservado in-place (nunca sobrescrito).
+  //   Texto mais curto → padding 0x00 (render para em null, terminador não se move)
+  //   Texto mais longo → truncado na palavra para caber no slot original
   // -----------------------------------------------------------------------
   void _loadEvdl(Uint8List data) {
     bool isTextByte(int b) =>
         b == 0x01 || (b >= 0x2B && b <= 0x6F) || b >= 0xC0;
+    bool isEvdlTerminator(int b) => b == 0x06 || b == 0x02;
 
     int i = 0;
     while (i < data.length) {
       if (!isTextByte(data[i])) { i++; continue; }
       final start = i;
       while (i < data.length && isTextByte(data[i])) i++;
-      // Só é diálogo se o run terminar exatamente em 0x06
-      if (i < data.length && data[i] == 0x06) {
+      // Aceita 0x06 (opcode) e 0x02 (string end) como fim de segmento
+      if (i < data.length && isEvdlTerminator(data[i])) {
         final decoded = KH1Encoding.decode(data.sublist(start, i));
         final alpha = decoded
             .replaceAll(RegExp(r'\[[^\]]+\]'), '')
@@ -454,19 +456,21 @@ class ExchangeFile {
     }
   }
 
-  // Patch in-place: substitui texto nos slots EVDL sem mover o 0x06
+  // Patch in-place: substitui texto nos slots EVDL sem mover o terminador
   void _saveEvdl(String outDirPath, String spFileName) {
     final bytes = Uint8List.fromList(_rawData);
     for (int i = 0; i < strings.length && i < _rawOffsets.length; i++) {
       final off = _rawOffsets[i];
-      // Comprimento original: bytes até 0x06 (exclusive)
+      // Comprimento original: bytes até 0x06 ou 0x02 (exclusive) — preserva terminador
       int origLen = 0;
-      while (off + origLen < bytes.length && bytes[off + origLen] != 0x06) {
+      while (off + origLen < bytes.length &&
+             bytes[off + origLen] != 0x06 &&
+             bytes[off + origLen] != 0x02) {
         origLen++;
       }
       // Codifica texto traduzido
       Uint8List encoded = KH1Encoding.encode(strings[i]);
-      // Se maior que o slot: trunca na palavra para caber sem deslocar o 0x06
+      // Se maior que o slot: trunca na palavra para caber sem deslocar o terminador
       if (encoded.length > origLen) {
         final truncated = KH1BatchTranslator._evmsgTruncateAtWord(strings[i], origLen);
         encoded = KH1Encoding.encode(truncated);
@@ -475,7 +479,7 @@ class ExchangeFile {
       for (int j = 0; j < encoded.length; j++) {
         bytes[off + j] = encoded[j];
       }
-      // Padding 0x00: render KH1 para em null, 0x06 permanece na posição correta
+      // Padding 0x00: render KH1 para em null, terminador (0x06/0x02) permanece no lugar
       for (int j = encoded.length; j < origLen; j++) {
         bytes[off + j] = 0x00;
       }
