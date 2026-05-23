@@ -309,6 +309,11 @@ class ExchangeFile {
   List<int> _rawOffsets = [];  // byte offsets das strings não-vazias
   Uint8List _rawData = Uint8List(0);
 
+  // Para EVDL: offset do segundo run quando duas linhas foram fundidas numa bolha de diálogo.
+  // -1 = string standalone (sem continuação); ≥ 0 = offset do 2º run no arquivo original.
+  // Duas linhas separadas por 0x02 + ≤6 bytes de controle = uma bolha com 2 linhas no jogo.
+  List<int> _evdlCont2Offsets = [];
+
   // Para _saveSingle(): rastreia TODAS as posições incluindo vagas vazias
   // Necessário para preservar índice sequencial (raw index) que o game usa para buscar strings
   List<int> _rawAllPositions = [];   // offset de cada segmento (vazio ou não)
@@ -348,6 +353,7 @@ class ExchangeFile {
   void load() {
     strings.clear();
     _rawOffsets.clear();
+    _evdlCont2Offsets.clear();
     _rawAllPositions.clear();
     _rawAllIsEmpty.clear();
     _rawSuffixes.clear();
@@ -454,11 +460,12 @@ class ExchangeFile {
         b == 0x01 || (b >= 0x2B && b <= 0x6F) || (b >= 0x70 && b <= 0xBF) || b >= 0xC0;
     bool isEvdlTerminator(int b) => b == 0x00 || b == 0x06 || b == 0x02;
 
+    // 1ª passagem: coleta todos os runs válidos
+    final List<({int start, int end, int term})> runs = [];
     int i = 0;
     while (i < data.length) {
       if (!isStartByte(data[i])) { i++; continue; }
       final start = i;
-      // Inclui BTN bytes (apóstrofes, ícones) no meio do run para não partir palavras
       while (i < data.length && isMidByte(data[i])) i++;
       if (i < data.length && isEvdlTerminator(data[i])) {
         final decoded = KH1Encoding.decode(data.sublist(start, i));
@@ -467,40 +474,89 @@ class ExchangeFile {
             .replaceAll(' ', '')
             .trim();
         if (alpha.length >= 4 && alpha.contains(RegExp(r'[a-zA-Z]'))) {
-          _rawOffsets.add(start);
-          strings.add(decoded);
+          runs.add((start: start, end: i, term: data[i]));
         }
       }
     }
+
+    // 2ª passagem: funde pares de continuação.
+    // Dois runs consecutivos formam UMA bolha de 2 linhas quando:
+    //   - run[r] termina com 0x02 (quebra de linha dentro da bolha)
+    //   - gap entre run[r].end e run[r+1].start ≤ 6 bytes (só controle binário)
+    // O texto fundido usa '\n' como separador de linha (permite ao usuário ver ambas).
+    // No save, o '\n' define o ponto de corte entre os dois slots originais.
+    final Set<int> merged2 = {}; // índices que são 2ª metade de uma fusão (não entram em strings)
+    for (int r = 0; r < runs.length - 1; r++) {
+      if (runs[r].term != 0x02) continue;
+      if (merged2.contains(r)) continue; // esta já é 2ª metade de outra fusão
+      final gap = runs[r + 1].start - runs[r].end;
+      if (gap > 6) continue;
+      merged2.add(r + 1);
+      final line1 = KH1Encoding.decode(data.sublist(runs[r].start, runs[r].end));
+      final line2 = KH1Encoding.decode(data.sublist(runs[r + 1].start, runs[r + 1].end));
+      _rawOffsets.add(runs[r].start);
+      _evdlCont2Offsets.add(runs[r + 1].start);
+      strings.add('$line1\n$line2');
+    }
+
+    // Adiciona runs que não fazem parte de nenhuma fusão
+    for (int r = 0; r < runs.length; r++) {
+      if (merged2.contains(r)) continue;
+      // Verifica se este run já foi adicionado como 1ª linha de fusão
+      final alreadyAdded = _rawOffsets.contains(runs[r].start);
+      if (alreadyAdded) continue;
+      _rawOffsets.add(runs[r].start);
+      _evdlCont2Offsets.add(-1);
+      strings.add(KH1Encoding.decode(data.sublist(runs[r].start, runs[r].end)));
+    }
   }
 
-  // Patch in-place: substitui texto nos slots EVDL sem mover o terminador
+  // Patch in-place: substitui texto nos slots EVDL sem mover o terminador.
+  // Para strings fundidas (cont2Offset ≥ 0), divide na '\n' e salva cada metade no slot original.
   void _saveEvdl(String outDirPath, String spFileName) {
     final bytes = Uint8List.fromList(_rawData);
-    for (int i = 0; i < strings.length && i < _rawOffsets.length; i++) {
-      final off = _rawOffsets[i];
-      // Comprimento original: bytes até terminador (0x00, 0x06, 0x02) — preserva terminador
-      int origLen = 0;
-      while (off + origLen < bytes.length &&
-             bytes[off + origLen] != 0x00 &&
-             bytes[off + origLen] != 0x06 &&
-             bytes[off + origLen] != 0x02) {
-        origLen++;
+
+    int _origSlotLen(int off) {
+      int len = 0;
+      while (off + len < bytes.length &&
+             bytes[off + len] != 0x00 &&
+             bytes[off + len] != 0x06 &&
+             bytes[off + len] != 0x02) {
+        len++;
       }
-      // Codifica texto traduzido
-      Uint8List encoded = KH1Encoding.encode(strings[i]);
-      // Se maior que o slot: trunca na palavra para caber sem deslocar o terminador
+      return len;
+    }
+
+    void _patchSlot(int off, int origLen, String text) {
+      Uint8List encoded = KH1Encoding.encode(text);
       if (encoded.length > origLen) {
-        final truncated = KH1BatchTranslator._evmsgTruncateAtWord(strings[i], origLen);
+        final truncated = KH1BatchTranslator._evmsgTruncateAtWord(text, origLen);
         encoded = KH1Encoding.encode(truncated);
         if (encoded.length > origLen) encoded = encoded.sublist(0, origLen);
       }
-      for (int j = 0; j < encoded.length; j++) {
-        bytes[off + j] = encoded[j];
-      }
-      // Padding 0x00: render KH1 para em null, terminador (0x06/0x02) permanece no lugar
-      for (int j = encoded.length; j < origLen; j++) {
-        bytes[off + j] = 0x00;
+      for (int j = 0; j < encoded.length; j++) bytes[off + j] = encoded[j];
+      for (int j = encoded.length; j < origLen; j++) bytes[off + j] = 0x00;
+    }
+
+    for (int i = 0; i < strings.length && i < _rawOffsets.length; i++) {
+      final off1   = _rawOffsets[i];
+      final off2   = i < _evdlCont2Offsets.length ? _evdlCont2Offsets[i] : -1;
+      final origLen1 = _origSlotLen(off1);
+
+      if (off2 >= 0) {
+        // String fundida: split na '\n' se presente, senão usa todo o texto no slot1
+        final origLen2 = _origSlotLen(off2);
+        final nl = strings[i].indexOf('\n');
+        if (nl >= 0) {
+          _patchSlot(off1, origLen1, strings[i].substring(0, nl));
+          _patchSlot(off2, origLen2, strings[i].substring(nl + 1));
+        } else {
+          // Usuário removeu a quebra: tenta caber no slot1, limpa slot2
+          _patchSlot(off1, origLen1, strings[i]);
+          _patchSlot(off2, origLen2, '');
+        }
+      } else {
+        _patchSlot(off1, origLen1, strings[i]);
       }
     }
     File('$outDirPath/$spFileName').writeAsBytesSync(bytes);
