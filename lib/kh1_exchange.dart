@@ -294,6 +294,7 @@ class ExchangeFile {
   final bool isMessageV361;   // true = formato "Message v361" (sysmsg.binl) com header+tabela
   final bool isEvMsg;         // true = formato EvMsg (binl com magic "EvMsg") — rebuild, não inPlace
   final bool nullOnly;        // true = _loadSingle() divide só em 0x00 (arquivos Help com 0x02 interno)
+  final bool isEvdl;          // true = EVDL binary script, diálogos inline separados por 0x06
 
   List<String> strings = []; // strings decodificadas (apenas não-vazias) — para a UI
   List<int> _rawOffsets = [];  // byte offsets das strings não-vazias
@@ -326,6 +327,7 @@ class ExchangeFile {
     this.isMessageV361 = false,
     this.isEvMsg = false,
     this.nullOnly = false,
+    this.isEvdl = false,
   });
 
   // -----------------------------------------------------------------------
@@ -345,7 +347,9 @@ class ExchangeFile {
     final data = File(ukDataPath).readAsBytesSync();
     _rawData = data;
 
-    if (isEvMsg) {
+    if (isEvdl) {
+      _loadEvdl(data);
+    } else if (isEvMsg) {
       _loadEvMsg(data);
     } else if (isMessageV361) {
       _loadMessageV361(data);
@@ -415,6 +419,68 @@ class ExchangeFile {
         _evmsgAllStringIdx.add(-1); // não é texto real, preservar verbatim
       }
     }
+  }
+
+  // -----------------------------------------------------------------------
+  // Formato EVDL (Event Data List — scripts de evento com diálogo inline):
+  //   Texto KH1 fica embutido diretamente no binário, separado pelo opcode 0x06.
+  //   Estrutura: [bytes de texto KH1][0x06][params]...
+  //   Bytes de texto válidos: 0x01 (espaço), 0x2B-0x6F (A-Z, a-z, pontuação),
+  //                           0xC0-0xFF (acentuados)
+  //   In-place: texto mais curto → padding 0x00 (render para em null, 0x06 não se move)
+  //             texto mais longo → truncado na palavra antes de atingir o 0x06
+  // -----------------------------------------------------------------------
+  void _loadEvdl(Uint8List data) {
+    bool isTextByte(int b) =>
+        b == 0x01 || (b >= 0x2B && b <= 0x6F) || b >= 0xC0;
+
+    int i = 0;
+    while (i < data.length) {
+      if (!isTextByte(data[i])) { i++; continue; }
+      final start = i;
+      while (i < data.length && isTextByte(data[i])) i++;
+      // Só é diálogo se o run terminar exatamente em 0x06
+      if (i < data.length && data[i] == 0x06) {
+        final decoded = KH1Encoding.decode(data.sublist(start, i));
+        final alpha = decoded
+            .replaceAll(RegExp(r'\[[^\]]+\]'), '')
+            .replaceAll(' ', '')
+            .trim();
+        if (alpha.length >= 3 && alpha.contains(RegExp(r'[a-zA-Z]'))) {
+          _rawOffsets.add(start);
+          strings.add(decoded);
+        }
+      }
+    }
+  }
+
+  // Patch in-place: substitui texto nos slots EVDL sem mover o 0x06
+  void _saveEvdl(String outDirPath, String spFileName) {
+    final bytes = Uint8List.fromList(_rawData);
+    for (int i = 0; i < strings.length && i < _rawOffsets.length; i++) {
+      final off = _rawOffsets[i];
+      // Comprimento original: bytes até 0x06 (exclusive)
+      int origLen = 0;
+      while (off + origLen < bytes.length && bytes[off + origLen] != 0x06) {
+        origLen++;
+      }
+      // Codifica texto traduzido
+      Uint8List encoded = KH1Encoding.encode(strings[i]);
+      // Se maior que o slot: trunca na palavra para caber sem deslocar o 0x06
+      if (encoded.length > origLen) {
+        final truncated = KH1BatchTranslator._evmsgTruncateAtWord(strings[i], origLen);
+        encoded = KH1Encoding.encode(truncated);
+        if (encoded.length > origLen) encoded = encoded.sublist(0, origLen);
+      }
+      for (int j = 0; j < encoded.length; j++) {
+        bytes[off + j] = encoded[j];
+      }
+      // Padding 0x00: render KH1 para em null, 0x06 permanece na posição correta
+      for (int j = encoded.length; j < origLen; j++) {
+        bytes[off + j] = 0x00;
+      }
+    }
+    File('$outDirPath/$spFileName').writeAsBytesSync(bytes);
   }
 
   void _loadPaired(Uint8List data) {
@@ -569,7 +635,9 @@ class ExchangeFile {
     final outDir = Directory('$outputBase/$relPath');
     outDir.createSync(recursive: true);
 
-    if (isEvMsg) {
+    if (isEvdl) {
+      _saveEvdl(outDir.path, spFileName);
+    } else if (isEvMsg) {
       _saveEvMsg(outDir.path, spFileName);
     } else if (isMessageV361) {
       _saveMessageV361(outDir.path, spFileName);
@@ -891,17 +959,19 @@ class KH1BatchTranslator {
   }
 
   // -----------------------------------------------------------------------
-  // Escaneia remastered/*.ard/UK_*.binl (legendas de cutscene)
+  // Escaneia remastered/*.ard/UK_*.{binl,evdl} (legendas + diálogos de cutscene)
   //
-  // ATENÇÃO: apenas arquivos .binl contêm texto de legenda.
-  //   .ev e .evdl são scripts de evento em formato binário puro — 07 0C 00
-  //   aparece neles como opcode de script, NÃO como marcador de texto.
-  //   Processá-los com inPlace=true corromperia os scripts do jogo.
+  // .binl — legendas de cutscene:
+  //   EvMsg (magic "EvMsg"): isEvMsg=true, rebuild livre
+  //   MessageV361:           isMessageV361=true, rebuild com tabela de offsets
+  //   Outros:                ignorados (binário puro sem texto)
   //
-  // Formatos suportados para .binl:
-  //   EvMsg (magic "EvMsg"): isEvMsg=true, inPlace=false (rebuild livre)
-  //   MessageV361:           isMessageV361=true, inPlace=false (rebuild com tabela)
-  //   Outros:                ignorados (binários sem texto)
+  // .evdl — Event Data List (scripts de evento com diálogos da história):
+  //   Texto KH1 fica inline separado pelo opcode 0x06.
+  //   isEvdl=true: scan por runs de bytes KH1 válidos terminados em 0x06,
+  //   patch in-place com padding 0x00 (render para em null; 0x06 não se move).
+  //
+  // .ev — scripts binários puros sem texto KH1 acessível; ignorados.
   // -----------------------------------------------------------------------
   List<ExchangeFile> _scanRemasteredEv() {
     final remasteredDir = Directory('$hedOutPath/remastered');
@@ -912,12 +982,23 @@ class KH1BatchTranslator {
       for (final f in entry.listSync().whereType<File>()) {
         final name = f.path.split('/').last;
         if (!name.startsWith('UK_')) continue;
-        // Apenas .binl contém legendas; .ev e .evdl são scripts binários de evento
-        if (!name.endsWith('.binl')) continue;
+        if (!name.endsWith('.binl') && !name.endsWith('.evdl')) continue;
+
+        // .evdl: diálogos da história — patch in-place via _loadEvdl/_saveEvdl
+        if (name.endsWith('.evdl')) {
+          result.add(ExchangeFile(
+            ukDataPath: f.path,
+            spDataPath: f.path.replaceFirst('/UK_', '/SP_'),
+            hasPair: false,
+            isEvdl: true,
+          ));
+          continue;
+        }
+
+        // .binl: legendas — detecta formato EvMsg ou MessageV361
         final raw = f.readAsBytesSync();
         final evMsg = _isEvMsg(raw);
         final isMsg361 = !evMsg && _isMessageV361(raw);
-        // Ignora .binl que não é formato reconhecido de texto (binário puro)
         if (!evMsg && !isMsg361) continue;
         result.add(ExchangeFile(
           ukDataPath: f.path,
