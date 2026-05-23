@@ -1,11 +1,11 @@
 import 'dart:collection';
-import 'dart:io';
 import 'dart:typed_data';
 import 'package:convert/convert.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:translator_plus/translator_plus.dart';
+import 'app_settings.dart';
 import 'kh1_exchange.dart';
 
 // =======================================================================
@@ -375,6 +375,16 @@ class MainMenuScreen extends StatelessWidget {
       appBar: AppBar(
         title: const Text('KH HD Text Editor'),
         centerTitle: true,
+        actions: [
+          IconButton(
+            tooltip: 'Configurações',
+            icon: const Icon(Icons.settings),
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (_) => const SettingsScreen()),
+            ),
+          ),
+        ],
       ),
       body: Center(
         child: Column(
@@ -1123,9 +1133,11 @@ class _ExchangeTranslateScreenState extends State<ExchangeTranslateScreen> {
     final outPath = _outPathCtrl.text.trim();
     if (hedPath.isEmpty || outPath.isEmpty) return;
 
+    final settings = await AppSettings.load();
     _translator = KH1BatchTranslator(
       hedOutPath: hedPath,
       outputBase: outPath,
+      translator: settings.buildAdapter(),
     );
 
     setState(() {
@@ -1206,18 +1218,21 @@ class _ExchangeTranslateScreenState extends State<ExchangeTranslateScreen> {
   // Traduz string individual
   // -----------------------------------------------------------------------
   Future<void> _translateSingle() async {
-    final t = GoogleTranslator();
     final original = _editCtrl.text;
     final Map<String, String> prot = {};
     final toTrans = KH1Encoding.protectTerms(original, prot);
     try {
-      final res = await t.translate(toTrans, from: 'en', to: 'pt');
-      final restored = KH1Encoding.restoreTerms(res.text, prot);
-      setState(() => _editCtrl.text = restored);
+      final settings = await AppSettings.load();
+      final result = await settings.buildAdapter().translate(toTrans);
+      if (result != null && mounted) {
+        setState(() => _editCtrl.text = KH1Encoding.restoreTerms(result, prot));
+      }
     } catch (e) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Erro na tradução: $e')),
-      );
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erro na tradução: $e')),
+        );
+      }
     }
   }
 
@@ -1255,6 +1270,14 @@ class _ExchangeTranslateScreenState extends State<ExchangeTranslateScreen> {
                 label: const Text('Traduzir Tudo',
                     style: TextStyle(color: Colors.white)),
               ),
+            IconButton(
+              tooltip: 'Configurações de tradução',
+              icon: const Icon(Icons.settings),
+              onPressed: () => Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => const SettingsScreen()),
+              ),
+            ),
           ],
         ],
       ),
@@ -1533,6 +1556,201 @@ class _ExchangeTranslateScreenState extends State<ExchangeTranslateScreen> {
           ),
         ],
       ),
+    );
+  }
+}
+
+// =======================================================================
+// TELA DE CONFIGURAÇÕES — Motor de tradução + URLs dos servidores
+// =======================================================================
+class SettingsScreen extends StatefulWidget {
+  const SettingsScreen({super.key});
+  @override
+  State<SettingsScreen> createState() => _SettingsScreenState();
+}
+
+class _SettingsScreenState extends State<SettingsScreen> {
+  String _pref = AppSettings.defaultPref;
+  final TextEditingController _llamaCtrl =
+      TextEditingController(text: AppSettings.defaultLlamaUrl);
+  final TextEditingController _helsinkiCtrl =
+      TextEditingController(text: AppSettings.defaultHelsinkiUrl);
+  bool _loading = true;
+  bool _saving = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  @override
+  void dispose() {
+    _llamaCtrl.dispose();
+    _helsinkiCtrl.dispose();
+    super.dispose();
+  }
+
+  Future<void> _load() async {
+    final s = await AppSettings.load();
+    if (mounted) {
+      setState(() {
+        _pref = s.translatorPref;
+        _llamaCtrl.text = s.llamaUrl;
+        _helsinkiCtrl.text = s.helsinkiUrl;
+        _loading = false;
+      });
+    }
+  }
+
+  Future<void> _save() async {
+    setState(() => _saving = true);
+    final s = await AppSettings.load();
+    await s.saveAll(
+      pref: _pref,
+      llamaUrl: _llamaCtrl.text.trim().isEmpty
+          ? AppSettings.defaultLlamaUrl
+          : _llamaCtrl.text.trim(),
+      helsinkiUrl: _helsinkiCtrl.text.trim().isEmpty
+          ? AppSettings.defaultHelsinkiUrl
+          : _helsinkiCtrl.text.trim(),
+    );
+    if (mounted) {
+      setState(() => _saving = false);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+            content: Text('Configurações salvas!'),
+            duration: Duration(seconds: 2)),
+      );
+      Navigator.pop(context);
+    }
+  }
+
+  Widget _radio(String value, String label, String subtitle) {
+    return RadioListTile<String>(
+      value: value,
+      groupValue: _pref,
+      title: Text(label),
+      subtitle: Text(subtitle, style: const TextStyle(fontSize: 12)),
+      onChanged: (v) => setState(() => _pref = v!),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      appBar: AppBar(title: const Text('Configurações de Tradução')),
+      body: _loading
+          ? const Center(child: CircularProgressIndicator())
+          : SingleChildScrollView(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // --- Motor preferido ---
+                  const Text('Motor de Tradução',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 8),
+                  Card(
+                    child: Column(
+                      children: [
+                        _radio(
+                          'google',
+                          'Google Translate',
+                          'Online · Rápido · Sem configuração · Padrão',
+                        ),
+                        _radio(
+                          'llama',
+                          'LlamaCpp (llama-server)',
+                          'Local/VPS · GPU (Vulkan/CUDA) · Qualidade alta · Requer llama-server rodando',
+                        ),
+                        _radio(
+                          'helsinki',
+                          'Helsinki-NLP (servidor Python)',
+                          'Local/VPS · CPU · Offline · Requer translate_server.py rodando',
+                        ),
+                        _radio(
+                          'auto',
+                          'Automático (Llama → Helsinki → Google)',
+                          'Tenta cada motor em ordem · Cai para o próximo se indisponível',
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+
+                  // --- URLs ---
+                  const Text('URLs dos Servidores',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.bold)),
+                  const SizedBox(height: 4),
+                  const Text(
+                    'Configure o endereço do servidor se rodar em VPS ou porta diferente.',
+                    style: TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _llamaCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'URL do LlamaCpp',
+                      hintText: 'http://127.0.0.1:8080',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 12),
+                  TextField(
+                    controller: _helsinkiCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'URL do Helsinki-NLP',
+                      hintText: 'http://127.0.0.1:7654',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+
+                  // --- Nota ---
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    decoration: BoxDecoration(
+                      color: Colors.blue.withValues(alpha: 0.1),
+                      borderRadius: BorderRadius.circular(8),
+                      border: Border.all(color: Colors.blue.withValues(alpha: 0.3)),
+                    ),
+                    child: const Row(
+                      children: [
+                        Icon(Icons.info_outline, color: Colors.blueAccent, size: 18),
+                        SizedBox(width: 8),
+                        Expanded(
+                          child: Text(
+                            'Se o servidor configurado não responder, o app cai automaticamente para o Google Translate.',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 24),
+
+                  // --- Salvar ---
+                  SizedBox(
+                    width: double.infinity,
+                    child: ElevatedButton.icon(
+                      onPressed: _saving ? null : _save,
+                      icon: _saving
+                          ? const SizedBox(
+                              width: 16,
+                              height: 16,
+                              child: CircularProgressIndicator(strokeWidth: 2))
+                          : const Icon(Icons.save),
+                      label: const Text('Salvar'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
     );
   }
 }

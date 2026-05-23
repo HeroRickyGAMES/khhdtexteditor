@@ -2,6 +2,7 @@
 // Lógica de encoding/decoding e leitura/escrita dos arquivos exchange do KH1 HD
 // Programado por HeroRickyGAMES com a ajuda de Deus!
 
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 import 'package:translator_plus/translator_plus.dart';
@@ -771,7 +772,6 @@ class ExchangeFile {
     // Reconstrói o arquivo preservando o header "Message v361" e a tabela de offsets.
     // Cada slot é: encode(translatedText) + sufixo original (terminador + bytes extras).
     // Strings podem crescer/encolher livremente — sem truncamento.
-    final bd = _rawData.buffer.asByteData();
 
     // Constrói novo buffer de string data
     final List<int> strData = [];
@@ -931,12 +931,245 @@ class ExchangeFile {
 }
 
 // =============================================================================
+// TRANSLATOR ADAPTERS — Hexagonal: porta abstrata + adaptadores concretos
+//
+// Para adicionar um novo motor (ex: Ollama, DeepL):
+//   1. Criar classe que extends TranslatorAdapter
+//   2. Implementar translate() e isAvailable()
+//   3. Passar a instância ao KH1BatchTranslator
+// =============================================================================
+
+/// Porta abstrata de tradução. Todo motor implementa esta interface.
+abstract class TranslatorAdapter {
+  String get name;
+  Future<bool> isAvailable();
+  /// Traduz [text] (EN → PT-BR). Retorna null se falhar.
+  Future<String?> translate(String text);
+}
+
+/// Adaptador Google Translate (translator_plus) — fallback sempre disponível.
+class GoogleTranslatorAdapter extends TranslatorAdapter {
+  final GoogleTranslator _gt = GoogleTranslator();
+
+  @override
+  String get name => 'Google Translate';
+
+  @override
+  Future<bool> isAvailable() async => true;
+
+  @override
+  Future<String?> translate(String text) async {
+    for (int attempt = 0; attempt < 2; attempt++) {
+      try {
+        final result = await _gt
+            .translate(text, from: 'en', to: 'pt')
+            .timeout(const Duration(seconds: 15));
+        // Detecta se o texto já estava em português (não traduzido)
+        try {
+          if (result.sourceLanguage.code.toLowerCase().startsWith('pt')) return null;
+        } catch (_) {
+          if (result.text == text) return null;
+        }
+        return result.text;
+      } catch (_) {
+        if (attempt == 0) await Future.delayed(const Duration(seconds: 3));
+      }
+    }
+    return null;
+  }
+}
+
+/// Adaptador Helsinki-NLP local (translate_server.py).
+/// URL configurável — suporta servidor local ou VPS remota.
+class LocalHelsinkiAdapter extends TranslatorAdapter {
+  static const String defaultUrl = 'http://127.0.0.1:7654';
+  final String baseUrl;
+
+  LocalHelsinkiAdapter([this.baseUrl = defaultUrl]);
+
+  @override
+  String get name => 'Helsinki-NLP ($baseUrl)';
+
+  @override
+  Future<bool> isAvailable() async {
+    try {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 2);
+      final req = await client.getUrl(Uri.parse('$baseUrl/health'));
+      final res = await req.close().timeout(const Duration(seconds: 3));
+      await res.drain<void>();
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<String?> translate(String text) async {
+    try {
+      final client = HttpClient();
+      final req = await client.postUrl(Uri.parse('$baseUrl/translate'));
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode({'texts': [text]}));
+      final res = await req.close().timeout(const Duration(seconds: 30));
+      if (res.statusCode != 200) return null;
+      final body = await res.transform(utf8.decoder).join();
+      final data = jsonDecode(body) as Map<String, dynamic>;
+      final list = data['translations'] as List<dynamic>;
+      final result = list.isNotEmpty ? list[0] as String : null;
+      if (result == null || result == text) return null;
+      return result;
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Adaptador llama.cpp (llama-server com API OpenAI-compat, porta 8080).
+/// URL configurável — suporta GPU local (Vulkan/CUDA) ou VPS remota.
+class LlamaCppAdapter extends TranslatorAdapter {
+  static const String defaultUrl = 'http://127.0.0.1:8080';
+
+  static const String _systemPrompt =
+      'You are a professional video game translator. '
+      'Translate the given English text to Brazilian Portuguese (PT-BR). '
+      'Rules: '
+      '1. Preserve ALL control codes exactly as-is: [C:XX], [BTN:XX], [?:XX], [ACC:XX]. '
+      '2. Keep proper nouns unchanged: Sora, Riku, Kairi, Keyblade, Heartless, Nobody, Kingdom Hearts, etc. '
+      '3. Output ONLY the translation. No explanations, no quotes, no extra text.';
+
+  final String baseUrl;
+
+  LlamaCppAdapter([this.baseUrl = defaultUrl]);
+
+  @override
+  String get name => 'LlamaCpp ($baseUrl)';
+
+  @override
+  Future<bool> isAvailable() async {
+    try {
+      final client = HttpClient()
+        ..connectionTimeout = const Duration(seconds: 2);
+      final req = await client.getUrl(Uri.parse('$baseUrl/health'));
+      final res = await req.close().timeout(const Duration(seconds: 3));
+      await res.drain<void>();
+      return res.statusCode == 200;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  @override
+  Future<String?> translate(String text) async {
+    try {
+      final client = HttpClient();
+      final req = await client.postUrl(Uri.parse('$baseUrl/v1/chat/completions'));
+      req.headers.contentType = ContentType.json;
+      req.write(jsonEncode({
+        'messages': [
+          {'role': 'system', 'content': _systemPrompt},
+          {'role': 'user', 'content': text},
+        ],
+        'temperature': 0.1,
+        'max_tokens': 512,
+        'stream': false,
+      }));
+      final res = await req.close().timeout(const Duration(seconds: 60));
+      if (res.statusCode != 200) return null;
+      final body = await res.transform(utf8.decoder).join();
+      final data = jsonDecode(body) as Map<String, dynamic>;
+      final choices = data['choices'] as List<dynamic>?;
+      if (choices == null || choices.isEmpty) return null;
+      final content = (choices[0] as Map<String, dynamic>)['message']
+          ?['content'] as String?;
+      final trimmed = content?.trim();
+      if (trimmed == null || trimmed.isEmpty || trimmed == text.trim()) return null;
+      return trimmed;
+    } catch (_) {
+      return null;
+    }
+  }
+}
+
+/// Adaptador com fallback automático baseado na preferência do usuário.
+/// Verifica disponibilidade de cada motor uma única vez e tenta em ordem.
+/// Google Translate é sempre o último da cadeia (sempre disponível).
+class FallbackTranslatorAdapter extends TranslatorAdapter {
+  final List<TranslatorAdapter> _chain;
+  final List<bool?> _available;
+  bool _checked = false;
+
+  FallbackTranslatorAdapter._fromChain(this._chain)
+      : _available = List.filled(_chain.length, null);
+
+  /// Padrão: Google Translate apenas (sem dependências externas).
+  factory FallbackTranslatorAdapter() => FallbackTranslatorAdapter._fromChain([
+        GoogleTranslatorAdapter(),
+      ]);
+
+  /// Constrói cadeia de acordo com a preferência salva nas configurações.
+  ///   'google'   → Google apenas
+  ///   'llama'    → Llama → Google
+  ///   'helsinki' → Helsinki → Google
+  ///   'auto'     → Llama → Helsinki → Google
+  static FallbackTranslatorAdapter fromPreference(
+    String pref,
+    String llamaUrl,
+    String helsinkiUrl,
+  ) {
+    final google = GoogleTranslatorAdapter();
+    switch (pref) {
+      case 'llama':
+        return FallbackTranslatorAdapter._fromChain([
+          LlamaCppAdapter(llamaUrl), google,
+        ]);
+      case 'helsinki':
+        return FallbackTranslatorAdapter._fromChain([
+          LocalHelsinkiAdapter(helsinkiUrl), google,
+        ]);
+      case 'auto':
+        return FallbackTranslatorAdapter._fromChain([
+          LlamaCppAdapter(llamaUrl),
+          LocalHelsinkiAdapter(helsinkiUrl),
+          google,
+        ]);
+      default: // 'google'
+        return FallbackTranslatorAdapter._fromChain([google]);
+    }
+  }
+
+  @override
+  String get name => _chain.map((a) => a.name).join(' → ');
+
+  @override
+  Future<bool> isAvailable() async => true;
+
+  @override
+  Future<String?> translate(String text) async {
+    if (!_checked) {
+      // Verifica disponibilidade de todos em paralelo (uma única vez por sessão)
+      final results = await Future.wait(_chain.map((a) => a.isAvailable()));
+      for (int i = 0; i < results.length; i++) {
+        _available[i] = results[i];
+      }
+      _checked = true;
+    }
+    for (int i = 0; i < _chain.length; i++) {
+      if (_available[i] == false) continue;
+      final result = await _chain[i].translate(text);
+      if (result != null) return result;
+    }
+    return null;
+  }
+}
+
+// =============================================================================
 // BATCH TRANSLATOR — escaneia pasta exchange e traduz todos os UK_ → SP_ PT-BR
 // =============================================================================
 class KH1BatchTranslator {
   final String hedOutPath;   // ex: /run/media/.../kh1_first.hed_out
   final String outputBase;   // ex: /run/media/.../khtraduzido
-  final GoogleTranslator _translator = GoogleTranslator();
+  final TranslatorAdapter translator;
 
   // Callbacks de progresso
   Function(int current, int total, String status)? onProgress;
@@ -944,7 +1177,11 @@ class KH1BatchTranslator {
   Function(String error)? onError;
   bool cancelled = false;
 
-  KH1BatchTranslator({required this.hedOutPath, required this.outputBase});
+  KH1BatchTranslator({
+    required this.hedOutPath,
+    required this.outputBase,
+    TranslatorAdapter? translator,
+  }) : translator = translator ?? FallbackTranslatorAdapter();
 
   // -----------------------------------------------------------------------
   // Descobre todos os kh1_*.hed_out dentro de uma pasta raiz
@@ -1189,11 +1426,6 @@ class KH1BatchTranslator {
       if (!_isTextFile(rawBytes, name)) continue;
 
       // Verifica se tem par de offsets
-      final baseName = name.replaceFirst('UK_', '');
-      final dataName = baseName.replaceAll(RegExp(r'\.bin$'), '_data.bin');
-      final ofsName1 = baseName.replaceAll(RegExp(r'\.bin$'), '_offset.bin');
-      final ofsName2 = baseName.replaceAll(RegExp(r'\.bin$'), '_ofs.bin');
-
       String? offsetPath;
       bool hasPair = false;
 
@@ -1348,43 +1580,20 @@ class KH1BatchTranslator {
             final Map<String, String> prot = {};
             final toTranslate = KH1Encoding.protectTerms(original, prot);
 
-            // Tenta até 2 vezes (retry em timeout/erro transitório)
-            Translation? translation;
-            for (int attempt = 0; attempt < 2; attempt++) {
-              try {
-                translation = await _translator.translate(
-                  toTranslate,
-                  from: 'en',
-                  to: 'pt',
-                ).timeout(const Duration(seconds: 15));
-                break;
-              } catch (_) {
-                if (attempt == 0) {
-                  await Future.delayed(const Duration(seconds: 3));
-                } else {
-                  rethrow;
-                }
-              }
-            }
+            String? translatedText = await translator.translate(toTranslate);
 
-            String translatedText = translation!.text;
-            bool alreadyPt = false;
-            try {
-              alreadyPt = translation.sourceLanguage.code
-                  .toLowerCase()
-                  .startsWith('pt');
-            } catch (_) {
-              alreadyPt = translatedText == toTranslate;
-            }
-
-            if (alreadyPt) {
+            if (translatedText == null || translatedText == toTranslate) {
               skipped++;
             } else {
               translatedText = KH1Encoding.restoreTerms(translatedText, prot);
-              // Remover \n do texto traduzido — o game trata 0x0A como fim de string
-              translatedText = translatedText.replaceAll('\n', ' ').trim();
+              // EVDL: preserva \n (separa as duas linhas da bolha de diálogo)
+              // EvMsg/outros: strip \n — o game trata 0x0A como fim de string
+              if (!ef.isEvdl) {
+                translatedText = translatedText.replaceAll('\n', ' ').trim();
+              } else {
+                translatedText = translatedText.trim();
+              }
               // Para EvMsg: limita cada linha ao comprimento da linha original
-              // O balão é dimensionado para o texto inglês — PT mais longo causa overflow
               if (ef.isEvMsg) {
                 translatedText = _clampEvMsgLines(translatedText, original);
               }
