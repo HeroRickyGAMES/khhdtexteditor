@@ -432,23 +432,29 @@ class ExchangeFile {
   //   Texto mais longo → truncado na palavra para caber no slot original
   // -----------------------------------------------------------------------
   void _loadEvdl(Uint8List data) {
-    bool isTextByte(int b) =>
-        b == 0x01 || (b >= 0x2B && b <= 0x6F) || b >= 0xC0;
-    bool isEvdlTerminator(int b) => b == 0x06 || b == 0x02;
+    // Run DEVE começar com letra/pontuação ASCII-KH1 (0x2B-0x6F ou espaço 0x01).
+    // Bytes altos (0xC0-0xFF = acentuados) e BTN icons (0x70-0xBF) ao início
+    // indicam dado binário, não texto — rejeitados para evitar falsos positivos.
+    bool isStartByte(int b) => b == 0x01 || (b >= 0x2B && b <= 0x6F);
+    // Dentro do run aceita BTN icons (ex: 0x71 = apóstrofe em "Can't", "people's")
+    // e acentuados como parte do texto.
+    bool isMidByte(int b) =>
+        b == 0x01 || (b >= 0x2B && b <= 0x6F) || (b >= 0x70 && b <= 0xBF) || b >= 0xC0;
+    bool isEvdlTerminator(int b) => b == 0x00 || b == 0x06 || b == 0x02;
 
     int i = 0;
     while (i < data.length) {
-      if (!isTextByte(data[i])) { i++; continue; }
+      if (!isStartByte(data[i])) { i++; continue; }
       final start = i;
-      while (i < data.length && isTextByte(data[i])) i++;
-      // Aceita 0x06 (opcode) e 0x02 (string end) como fim de segmento
+      // Inclui BTN bytes (apóstrofes, ícones) no meio do run para não partir palavras
+      while (i < data.length && isMidByte(data[i])) i++;
       if (i < data.length && isEvdlTerminator(data[i])) {
         final decoded = KH1Encoding.decode(data.sublist(start, i));
         final alpha = decoded
             .replaceAll(RegExp(r'\[[^\]]+\]'), '')
             .replaceAll(' ', '')
             .trim();
-        if (alpha.length >= 3 && alpha.contains(RegExp(r'[a-zA-Z]'))) {
+        if (alpha.length >= 4 && alpha.contains(RegExp(r'[a-zA-Z]'))) {
           _rawOffsets.add(start);
           strings.add(decoded);
         }
@@ -461,9 +467,10 @@ class ExchangeFile {
     final bytes = Uint8List.fromList(_rawData);
     for (int i = 0; i < strings.length && i < _rawOffsets.length; i++) {
       final off = _rawOffsets[i];
-      // Comprimento original: bytes até 0x06 ou 0x02 (exclusive) — preserva terminador
+      // Comprimento original: bytes até terminador (0x00, 0x06, 0x02) — preserva terminador
       int origLen = 0;
       while (off + origLen < bytes.length &&
+             bytes[off + origLen] != 0x00 &&
              bytes[off + origLen] != 0x06 &&
              bytes[off + origLen] != 0x02) {
         origLen++;
